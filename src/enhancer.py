@@ -1,3 +1,6 @@
+"""
+Image Enhancer - Enhance imagini cu Recraft AI + Modificare pentru unicitate.
+"""
 
 import os
 import requests
@@ -7,6 +10,7 @@ import base64
 from typing import Optional
 from src.models import Tweet, MediaType
 from src.config import ai_config
+from src.image_modifier import ImageModifier  # ← ADAUGĂ ACEST IMPORT
 
 
 class ImageEnhancer:
@@ -15,7 +19,8 @@ class ImageEnhancer:
     def __init__(self):
         self.api_key = ai_config.WAVESPEED_API_KEY
         self.base_url = "https://api.wavespeed.ai/api/v3"
-        self.timeout = ai_config.ENHANCE_TIMEOUT  # Timeout maxim pentru procesare (secunde)
+        self.timeout = ai_config.ENHANCE_TIMEOUT
+        self.modifier = ImageModifier()  # ← ADAUGĂ ACEASTĂ LINIE
         
         if not self.api_key:
             print("⚠️ WAVESPEED_API_KEY nu e setat în config!")
@@ -74,7 +79,6 @@ class ImageEnhancer:
         start_time = time.time()
         
         while True:
-            # Verifică timeout
             elapsed = time.time() - start_time
             if elapsed > self.timeout:
                 print(f"   ❌ Timeout după {self.timeout} secunde")
@@ -98,7 +102,6 @@ class ImageEnhancer:
                         return None
                         
                     else:
-                        # Încă procesează
                         print(f"   ⏳ Status: {status} ({elapsed:.1f}s)...")
                         
                 else:
@@ -108,7 +111,6 @@ class ImageEnhancer:
             except Exception as e:
                 print(f"   ⚠️ Eroare poll: {e}")
             
-            # Așteaptă înainte de următorul poll
             time.sleep(1)
     
     def _download_image(self, image_url: str, output_path: str) -> bool:
@@ -119,7 +121,6 @@ class ImageEnhancer:
             response = requests.get(image_url, timeout=30)
             
             if response.status_code == 200:
-                # Creează directorul dacă nu există
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 
                 with open(output_path, "wb") as f:
@@ -135,23 +136,37 @@ class ImageEnhancer:
             print(f"   ❌ Eroare download: {e}")
             return False
     
+    def _make_image_unique(self, image_path: str) -> str:
+        """
+        Face imaginea unică pentru a evita detectarea de duplicate.
+        ← METODĂ NOUĂ
+        """
+        print(f"   🎨 Fac imaginea unică...")
+        
+        result = self.modifier.make_unique(image_path, image_path)  # Suprascrie
+        
+        print(f"      ✅ Modificări: {self.modifier.get_modifications_log()}")
+        
+        return result
+    
     def enhance_image(
         self, 
         input_path: str, 
-        output_path: Optional[str] = None
+        output_path: Optional[str] = None,
+        make_unique: bool = True  # ← PARAMETRU NOU
     ) -> Optional[str]:
         """
-        Enhance o imagine cu Recraft AI.
+        Enhance o imagine cu Recraft AI + face unică.
         
         Args:
             input_path: Calea către imaginea originală
             output_path: Calea pentru salvare (optional)
+            make_unique: Dacă True, aplică modificări pentru unicitate (anti-detectare)
             
         Returns:
             Calea către imaginea enhanced sau None în caz de eroare
         """
         
-        # Generează output path dacă nu e specificat
         if not output_path:
             base, ext = os.path.splitext(input_path)
             output_path = f"{base}_enhanced{ext}"
@@ -159,14 +174,19 @@ class ImageEnhancer:
         print(f"\n✨ ENHANCE IMAGE: {input_path}")
         print(f"   {'─' * 50}")
         
-        # Verifică că fișierul există
         if not os.path.exists(input_path):
             print(f"   ❌ Fișierul nu există: {input_path}")
             return None
         
-        # Verifică API key
         if not self.api_key:
             print(f"   ❌ WAVESPEED_API_KEY nu e configurat!")
+            # ← FALLBACK: doar fă imaginea unică
+            if make_unique:
+                print(f"   ℹ️ Aplic doar modificări de unicitate...")
+                import shutil
+                shutil.copy2(input_path, output_path)
+                self._make_image_unique(output_path)
+                return output_path
             return None
         
         # Step 1: Encode în Base64
@@ -175,17 +195,37 @@ class ImageEnhancer:
         # Step 2: Submit task
         request_id = self._submit_upscale_task(image_base64)
         if not request_id:
+            # ← FALLBACK: doar fă imaginea unică
+            if make_unique:
+                print(f"   ℹ️ API failed, aplic doar modificări de unicitate...")
+                import shutil
+                shutil.copy2(input_path, output_path)
+                self._make_image_unique(output_path)
+                return output_path
             return None
         
         # Step 3: Poll pentru rezultat
         image_url = self._poll_for_result(request_id)
         if not image_url:
+            # ← FALLBACK: doar fă imaginea unică
+            if make_unique:
+                print(f"   ℹ️ Poll failed, aplic doar modificări de unicitate...")
+                import shutil
+                shutil.copy2(input_path, output_path)
+                self._make_image_unique(output_path)
+                return output_path
             return None
         
         # Step 4: Download imaginea
         success = self._download_image(image_url, output_path)
         if not success:
             return None
+        
+        # ═══════════════════════════════════════════════════
+        # Step 5: FAC IMAGINEA UNICĂ (ANTI-DETECTARE)  ← NOU!
+        # ═══════════════════════════════════════════════════
+        if make_unique:
+            self._make_image_unique(output_path)
         
         print(f"   {'─' * 50}")
         print(f"   🎉 ENHANCE COMPLET!")
@@ -196,12 +236,6 @@ class ImageEnhancer:
         """
         Enhance toate imaginile dintr-un tweet.
         Păstrează legătura media ↔ tweet.
-        
-        Args:
-            tweet: Tweet object cu media descărcat
-            
-        Returns:
-            Același Tweet object cu enhanced_path setat
         """
         
         print(f"\n{'═' * 60}")
@@ -218,28 +252,24 @@ class ImageEnhancer:
         for i, media in enumerate(tweet.media):
             print(f"\n   📷 Media #{i+1}:")
             
-            # Doar imagini (nu video)
             if media.type != MediaType.PHOTO:
                 print(f"      ⏭️ Skip (type: {media.type.value})")
                 continue
             
-            # Verifică dacă e descărcat
             if not media.local_path or not os.path.exists(media.local_path):
                 print(f"      ⚠️ Media nu e descărcat: {media.local_path}")
                 continue
             
-            # Generează output path
             base, ext = os.path.splitext(media.local_path)
             enhanced_path = f"{base}_enhanced{ext}"
             
-            # Enhance
-            result = self.enhance_image(media.local_path, enhanced_path)
+            # Enhance + Make Unique (make_unique=True by default)
+            result = self.enhance_image(media.local_path, enhanced_path, make_unique=True)
             
             if result:
                 media.enhanced_path = result
                 enhanced_count += 1
             else:
-                # Fallback: folosește originalul
                 print(f"      ⚠️ Fallback: folosesc imaginea originală")
                 media.enhanced_path = media.local_path
         
