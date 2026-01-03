@@ -4,10 +4,12 @@ Agent principal - orchestrează tot flow-ul.
 
 import json
 import os
+import re
 import random
+import requests
 from typing import List, Optional
 from datetime import datetime
-from src.models import Tweet
+from src.models import Tweet, Media, MediaType
 from src.fetcher import TwitterFetcher
 from src.enhancer import ImageEnhancer
 from src.rephraser import TextRephraser
@@ -20,8 +22,14 @@ class TwitterRepurposeAgent:
     Agent complet pentru repurposing tweets.
     """
     
-    def __init__(self):
-        self.fetcher = TwitterFetcher()
+    def __init__(self, skip_fetch_init: bool = True):
+        """
+        Args:
+            skip_fetch_init: Dacă True, nu inițializează fetcher-ul (pentru cloud)
+        """
+        # Fetcher e opțional (poate să nu fie nevoie pe cloud)
+        self.fetcher = None if skip_fetch_init else TwitterFetcher()
+        
         self.enhancer = ImageEnhancer()
         self.rephraser = TextRephraser()
         self.poster = SafePoster()
@@ -30,6 +38,175 @@ class TwitterRepurposeAgent:
         self.posted_tweets: List[Tweet] = []
         
         self._load_state()
+    
+    # ═══════════════════════════════════════════════════════════
+    # IMPORT MANUAL - Pentru adăugare locală de tweets
+    # ═══════════════════════════════════════════════════════════
+    
+    def add_tweet_manual(
+        self,
+        tweet_id: str,
+        author: str,
+        text: str,
+        image_urls: List[str] = None,
+        likes: int = 0,
+        retweets: int = 0
+    ) -> Optional[Tweet]:
+        """
+        Adaugă un tweet manual (fără API).
+        
+        Args:
+            tweet_id: ID-ul tweet-ului (din URL)
+            author: Username-ul autorului
+            text: Textul tweet-ului
+            image_urls: Lista de URL-uri pentru imagini
+            likes: Număr de likes
+            retweets: Număr de retweets
+            
+        Returns:
+            Tweet object sau None dacă există deja
+        """
+        
+        print(f"\n{'='*50}")
+        print(f"📥 ADDING TWEET MANUALLY")
+        print(f"{'='*50}")
+        
+        # Verifică duplicat
+        existing_ids = {t.id for t in self.tweets_queue + self.posted_tweets}
+        if tweet_id in existing_ids:
+            print(f"⚠️ Tweet {tweet_id} există deja!")
+            return None
+        
+        # Creează Tweet
+        tweet = Tweet(
+            id=tweet_id,
+            author=author,
+            original_text=text,
+            created_at=datetime.now(),
+            likes=likes,
+            retweets=retweets
+        )
+        
+        # Adaugă media
+        if image_urls:
+            for i, url in enumerate(image_urls):
+                tweet.media.append(Media(
+                    media_key=f"manual_{tweet_id}_{i}",
+                    type=MediaType.PHOTO,
+                    url=url
+                ))
+        
+        print(f"✅ Tweet creat: {tweet_id}")
+        print(f"   Author: @{author}")
+        print(f"   Text: {text[:50]}...")
+        print(f"   Media: {len(tweet.media)} items")
+        
+        # Download media
+        if tweet.has_media:
+            self._download_media_manual(tweet)
+        
+        # Adaugă în queue
+        self.tweets_queue.append(tweet)
+        self._save_state()
+        
+        return tweet
+    
+    def add_tweet_from_url(self, tweet_url: str) -> Optional[Tweet]:
+        """
+        Adaugă un tweet după URL - extrage ID și fetch minimal.
+        NOTĂ: Necesită API pentru fetch complet, sau folosește add_tweet_manual.
+        
+        Args:
+            tweet_url: URL complet (ex: https://twitter.com/user/status/123456)
+            
+        Returns:
+            Tweet object sau None
+        """
+        
+        # Extrage tweet ID
+        match = re.search(r'status/(\d+)', tweet_url)
+        if not match:
+            print(f"❌ URL invalid: {tweet_url}")
+            return None
+        
+        tweet_id = match.group(1)
+        
+        # Extrage username din URL
+        username_match = re.search(r'(?:twitter|x)\.com/(\w+)/status', tweet_url)
+        username = username_match.group(1) if username_match else "unknown"
+        
+        print(f"📋 Extras din URL:")
+        print(f"   ID: {tweet_id}")
+        print(f"   User: @{username}")
+        print(f"\n⚠️ Pentru date complete, folosește add_tweet_manual() cu text și imagini.")
+        
+        return None  # Returnează None - user trebuie să folosească add_tweet_manual
+    
+    def _download_media_manual(self, tweet: Tweet) -> None:
+        """Download media pentru un tweet adăugat manual."""
+        
+        tweet_folder = os.path.join(agent_config.DATA_FOLDER, tweet.id)
+        os.makedirs(tweet_folder, exist_ok=True)
+        
+        print(f"📥 Downloading media...")
+        
+        for i, media in enumerate(tweet.media):
+            if not media.url:
+                continue
+            
+            filename = f"{tweet_folder}/raw_media_{i+1}.jpg"
+            
+            try:
+                response = requests.get(media.url, timeout=30)
+                response.raise_for_status()
+                
+                with open(filename, "wb") as f:
+                    f.write(response.content)
+                
+                media.local_path = filename
+                print(f"   ✅ Salvat: {filename}")
+                
+            except Exception as e:
+                print(f"   ❌ Eroare download: {e}")
+        
+        tweet.is_downloaded = True
+    
+    def import_tweets_batch(self, tweets_data: List[dict]) -> int:
+        """
+        Import batch de tweets dintr-o listă de dicționare.
+        
+        Args:
+            tweets_data: Lista de dicts cu chei: id, author, text, images (optional)
+            
+        Returns:
+            Numărul de tweets importate
+        """
+        
+        print(f"\n{'='*50}")
+        print(f"📦 BATCH IMPORT: {len(tweets_data)} tweets")
+        print(f"{'='*50}")
+        
+        imported = 0
+        
+        for data in tweets_data:
+            tweet = self.add_tweet_manual(
+                tweet_id=data.get("id"),
+                author=data.get("author", "unknown"),
+                text=data.get("text", ""),
+                image_urls=data.get("images", []),
+                likes=data.get("likes", 0),
+                retweets=data.get("retweets", 0)
+            )
+            
+            if tweet:
+                imported += 1
+        
+        print(f"\n✅ Importate: {imported}/{len(tweets_data)} tweets")
+        return imported
+    
+    # ═══════════════════════════════════════════════════════════
+    # EXISTING METHODS (unchanged)
+    # ═══════════════════════════════════════════════════════════
     
     def _get_state_path(self) -> str:
         return os.path.join(agent_config.DATA_FOLDER, "agent_state.json")
@@ -70,6 +247,10 @@ class TwitterRepurposeAgent:
     ) -> List[Tweet]:
         """Fetch tweets de la un account și le adaugă în queue."""
         
+        if not self.fetcher:
+            print("❌ Fetcher nu e inițializat! Folosește add_tweet_manual()")
+            return []
+        
         print(f"\n{'='*50}")
         print(f"📥 FETCHING de la @{username}")
         print(f"{'='*50}")
@@ -90,22 +271,21 @@ class TwitterRepurposeAgent:
         return new_tweets
     
     def process_tweet(self, tweet: Tweet) -> Tweet:
-        """
-        Procesează un tweet: enhance + rephrase (stil ICT).
-        """
+        """Procesează un tweet: enhance + rephrase."""
         
         print(f"\n{'='*50}")
         print(f"⚙️ PROCESSING tweet {tweet.id}")
         print(f"{'='*50}")
         
         # Enhance imagini
-        if tweet.has_photo:
+        if tweet.has_photo and not tweet.is_enhanced:
             self.enhancer.enhance_tweet_media(tweet)
         else:
-            tweet.is_enhanced = True  # Marchează ca enhanced dacă nu are imagini
+            tweet.is_enhanced = True
         
-        # Rephrase text (stil ICT - hardcodat)
-        self.rephraser.rephrase_tweet(tweet)
+        # Rephrase text
+        if not tweet.is_rephrased:
+            self.rephraser.rephrase_tweet(tweet)
         
         self._save_state()
         return tweet
@@ -113,11 +293,11 @@ class TwitterRepurposeAgent:
     def process_all_queue(self):
         """Procesează toate tweets din queue."""
         
-        print(f"\n🔄 Processing {len(self.tweets_queue)} tweets...")
+        unprocessed = [t for t in self.tweets_queue if not t.is_ready_to_post]
+        print(f"\n🔄 Processing {len(unprocessed)} tweets...")
         
-        for tweet in self.tweets_queue:
-            if not tweet.is_ready_to_post:
-                self.process_tweet(tweet)
+        for tweet in unprocessed:
+            self.process_tweet(tweet)
         
         self._save_state()
     
@@ -145,44 +325,6 @@ class TwitterRepurposeAgent:
         
         return success
     
-    def run_daily_cycle(
-        self,
-        source_accounts: List[str],
-        tweets_per_account: int = 5,
-        posts_per_day: int = 3
-    ):
-        """Rulează un ciclu zilnic complet."""
-        
-        print(f"\n{'='*60}")
-        print(f"🤖 STARTING DAILY CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"{'='*60}")
-        
-        # 1. Fetch dacă queue e aproape gol
-        if len(self.tweets_queue) < posts_per_day * 2:
-            for account in source_accounts:
-                self.fetch_from_account(account, tweets_per_account, filter_with_media=True)
-        
-        # 2. Procesează toate
-        self.process_all_queue()
-        
-        # 3. Postează cu delay
-        for i in range(posts_per_day):
-            print(f"\n📍 Post {i+1}/{posts_per_day}")
-            
-            success = self.post_one_random()
-            
-            if success and i < posts_per_day - 1:
-                delay = random.randint(
-                    agent_config.MIN_DELAY_BETWEEN_POSTS,
-                    agent_config.MAX_DELAY_BETWEEN_POSTS
-                )
-                print(f"😴 Sleeping {delay//60} minute până la următorul post...")
-                import time
-                time.sleep(delay)
-        
-        print(f"\n✅ Daily cycle complete!")
-        self._save_state()
-    
     def get_status(self):
         """Afișează status agent."""
         
@@ -194,3 +336,9 @@ class TwitterRepurposeAgent:
         print(f"   - Need processing: {len([t for t in self.tweets_queue if not t.is_ready_to_post])}")
         print(f"✅ Postate: {len(self.posted_tweets)}")
         print(f"📤 Posturi azi: {self.poster.posts_today}/{agent_config.MAX_POSTS_PER_DAY}")
+        
+        if self.tweets_queue:
+            print(f"\n📋 QUEUE:")
+            for i, t in enumerate(self.tweets_queue[:5], 1):
+                status = "✅" if t.is_ready_to_post else "⏳"
+                print(f"   {i}. {status} [{t.id}] {t.original_text[:40]}...")
